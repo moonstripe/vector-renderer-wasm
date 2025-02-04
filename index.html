@@ -1,0 +1,64 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>WASM Example</title>
+    <link rel="icon" type="image/x-icon" href="assets/static/favicon.ico" />
+  </head>
+  <body style="margin: 0">
+    <div style="margin: 1rem">
+      <p>Add an embedding:</p>
+      <input
+        type="number"
+        id="idx0"
+        min="-1.0"
+        max="1.0"
+        value="0.0"
+        step="0.01"
+      />
+      <input
+        type="number"
+        id="idx1"
+        min="-1.0"
+        max="1.0"
+        value="0.0"
+        step="0.01"
+      />
+      <input
+        type="number"
+        id="idx2"
+        min="-1.0"
+        max="1.0"
+        value="0.0"
+        step="0.01"
+      />
+      <button type="submit" id="embeddingSubmit">Submit</button>
+    </div>
+
+    <canvas id="vector-canvas"></canvas>
+    <script type="module">
+      import init, { add_embedding } from "./wasm/vector-renderer.js";
+
+      let idx0 = document.querySelector("#idx0");
+      let idx1 = document.querySelector("#idx1");
+      let idx2 = document.querySelector("#idx2");
+
+      let submitButton = document.querySelector("#embeddingSubmit");
+
+      submitButton.onclick = () => {
+        console.log(`Submitting [${idx0.value}, ${idx1.value}, ${idx2.value}]`);
+        add_embedding(
+          parseFloat(idx0.value),
+          parseFloat(idx1.value),
+          parseFloat(idx2.value),
+        );
+      };
+
+      init()
+        .then(() => console.log("HELLO FROM THEN"))
+        .catch((error) => {
+          console.error("Error initializing WASM:", error);
+        });
+    </script>
+  </body>
+</html>
