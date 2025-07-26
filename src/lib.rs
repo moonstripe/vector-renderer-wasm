@@ -314,6 +314,7 @@ pub fn run() {
             EguiPlugin,
         ))
         .add_plugins(DefaultPickingPlugins)
+        .insert_resource(ClearColor(Color::NONE))
         .insert_resource(RendererState { texts: None })
         .insert_resource(EmbeddingQueueResource)
         .add_systems(Startup, startup)
