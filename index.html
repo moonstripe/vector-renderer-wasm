@@ -33,29 +33,53 @@
         step="0.01"
       />
       <button type="submit" id="embeddingSubmit">Submit</button>
+      <input type="text" id="deleteEmbedding" />
+      <button type="submit" id="embeddingDelete">Delete</button>
+      <button type="submit" id="getEmbeddings">Get</button>
     </div>
 
     <canvas id="vector-canvas"></canvas>
     <script type="module">
-      import init, { add_embedding } from "./wasm/vector-renderer.js";
+      import init, {
+        add_embedding,
+        delete_embedding_by_id,
+        get_embeddings
+      } from "./wasm/vector-renderer.js";
 
+      if (typeof window.should_show_ui !== "function") {
+        window.should_show_ui = () => false; // default to hiding the UI
+      }
       let idx0 = document.querySelector("#idx0");
       let idx1 = document.querySelector("#idx1");
       let idx2 = document.querySelector("#idx2");
 
       let submitButton = document.querySelector("#embeddingSubmit");
+      let getButton = document.querySelector("#getEmbeddings");
+      let deleteButton = document.querySelector("#embeddingDelete");
 
       submitButton.onclick = () => {
         console.log(`Submitting [${idx0.value}, ${idx1.value}, ${idx2.value}]`);
         add_embedding(
           parseFloat(idx0.value),
           parseFloat(idx1.value),
-          parseFloat(idx2.value),
+          parseFloat(idx2.value)
         );
       };
 
+      getButton.onclick = () => {
+        console.log("Embeddings:", get_embeddings());
+      };
+
+      embeddingDelete.onclick = () => {
+        const id = document.querySelector("#deleteEmbedding").value;
+
+        delete_embedding_by_id(id);
+      };
+
       init()
-        .then(() => console.log("HELLO FROM THEN"))
+        .then(() => {
+          console.log("THEN");
+        })
         .catch((error) => {
           console.error("Error initializing WASM:", error);
         });

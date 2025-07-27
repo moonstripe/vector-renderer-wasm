@@ -18,59 +18,52 @@ use bevy_mod_picking::prelude::*;
 use bevy_panorbit_camera::{PanOrbitCamera, PanOrbitCameraPlugin};
 use once_cell::sync::Lazy;
 use rand::Rng;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
+use uuid::Uuid;
 use wasm_bindgen::prelude::*;
 
 const AXIS_LENGTH: f32 = 500.;
 
-// TODO: Make sure that [f32; 3] is replaced with a copyable struct with an id to delete.
-static EMBEDDING_QUEUE: Lazy<Mutex<Vec<[f32; 3]>>> = Lazy::new(|| Mutex::new(Vec::new()));
+static EMBEDDING_QUEUE: Lazy<Mutex<Vec<JsEmbedding>>> = Lazy::new(|| Mutex::new(Vec::new()));
+static DELETE_QUEUE: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
+static RENDERED_EMBEDDINGS: Lazy<Mutex<Vec<TextEmbedding>>> = Lazy::new(|| Mutex::new(Vec::new()));
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JsEmbedding {
+    pub id: String,
+    pub position: [f32; 3],
+}
 
 #[derive(Resource)]
 struct EmbeddingQueueResource;
 
-fn process_new_embeddings(mut renderer_state: ResMut<RendererState>) {
-    info!("process_new_embeddings");
-    let start = instant::now();
-    match EMBEDDING_QUEUE.try_lock() {
-        Ok(mut queue) => {
-            for embedding in queue.drain(..) {
-                let text = TextEmbedding {
-                    embedding,
-                    drawn: false,
-                };
-                if let Some(texts) = &mut renderer_state.texts {
-                    texts.push(text);
-                } else {
-                    renderer_state.texts = Some(vec![text]);
-                }
-            }
-            let end = instant::now();
-
-            info!("process_new_embeddings: {:#?}", end - start);
-        }
-        Err(e) => {
-            warn!("could not get lock... {:#?}", e);
-            let end = instant::now();
-
-            info!("process_new_embeddings: {:#?}", end - start);
-        }
+#[wasm_bindgen]
+pub fn add_embedding(x: f32, y: f32, z: f32) -> String {
+    let embedding = JsEmbedding {
+        id: Uuid::new_v4().to_string(),
+        position: [x, y, z],
     };
+
+    EMBEDDING_QUEUE.lock().unwrap().push(embedding.clone());
+
+    embedding.id
 }
 
 #[wasm_bindgen]
-pub fn add_embedding(x: f32, y: f32, z: f32) {
-    let start = instant::Instant::now();
-    let mut queue = EMBEDDING_QUEUE.lock().unwrap();
-
-    queue.push([x, y, z]);
-    let end = instant::Instant::now();
-    info!("Startup Lazy Queue: {:#?}", end - start);
+pub fn get_embeddings() -> JsValue {
+    let export = RENDERED_EMBEDDINGS.lock().unwrap();
+    serde_wasm_bindgen::to_value(&*export).unwrap_or(JsValue::NULL)
 }
 
-#[derive(Component, Debug, Clone, Copy, Deserialize)]
+#[wasm_bindgen]
+pub fn delete_embedding_by_id(id: String) {
+    DELETE_QUEUE.lock().unwrap().push(id);
+}
+
+#[derive(Component, Debug, Clone, Serialize, Deserialize)]
 struct TextEmbedding {
+    id: String,
     embedding: [f32; 3],
     drawn: bool,
 }
@@ -109,6 +102,9 @@ struct RendererState {
     texts: Option<Vec<TextEmbedding>>,
 }
 
+#[derive(Resource, Default)]
+struct EmbeddingEntities(pub std::collections::HashMap<String, Entity>);
+
 impl From<Axis> for Mesh {
     fn from(axis: Axis) -> Self {
         let vertices = axis.line.to_vec();
@@ -121,6 +117,48 @@ impl From<Axis> for Mesh {
         )
         // Add the vertices positions as an attribute
         .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, vertices)
+    }
+}
+
+fn process_new_embeddings(mut renderer_state: ResMut<RendererState>) {
+    match EMBEDDING_QUEUE.try_lock() {
+        Ok(mut queue) => {
+            for embedding in queue.drain(..) {
+                let text = TextEmbedding {
+                    id: embedding.id,
+                    embedding: embedding.position,
+                    drawn: false,
+                };
+                if let Some(texts) = &mut renderer_state.texts {
+                    texts.push(text);
+                } else {
+                    renderer_state.texts = Some(vec![text]);
+                }
+            }
+        }
+        Err(e) => {
+            warn!("could not get lock... {:#?}", e);
+        }
+    };
+}
+
+fn process_delete_embedding_requests(
+    mut renderer_state: ResMut<RendererState>,
+    mut entity_map: ResMut<EmbeddingEntities>,
+    mut commands: Commands,
+) {
+    let mut queue = DELETE_QUEUE.lock().unwrap();
+
+    if let Some(texts) = &mut renderer_state.texts {
+        for id in queue.drain(..) {
+            // Remove entity from world if present
+            if let Some(entity) = entity_map.0.remove(&id) {
+                commands.entity(entity).despawn_recursive(); // despawn associated entity
+            }
+
+            // Remove from texts
+            texts.retain(|t| t.id != id);
+        }
     }
 }
 
@@ -188,35 +226,36 @@ fn startup(
     });
 }
 
-fn update(mut contexts: EguiContexts, mut renderer_state: ResMut<RendererState>) {
-    egui::Window::new("Options")
-        .movable(false)
-        .show(contexts.ctx_mut(), |ui| {
-            let num_texts = match &mut renderer_state.texts {
-                Some(num_texts) => num_texts.len(),
-                None => 0,
-            };
+fn update(mut contexts: EguiContexts, renderer_state: Res<RendererState>) {
+    if should_show_ui() {
+        egui::Window::new("Options")
+            .collapsible(true)
+            .movable(false)
+            .show(contexts.ctx_mut(), |ui| {
+                let num_texts = renderer_state.texts.as_ref().map_or(0, |t| t.len());
 
-            ui.label(format!("Rendering {} Text Embeddings.", num_texts));
+                ui.label(format!("Rendering {} Text Embeddings.", num_texts));
 
-            if ui.button("Add Random Text Embedding").clicked() {
-                info!("Adding Random Text Embedding...");
+                if ui.button("Add Random Text Embedding").clicked() {
+                    let mut rng = rand::thread_rng();
+                    let x = rng.gen_range(-1.0..1.0);
+                    let y = rng.gen_range(-1.0..1.0);
+                    let z = rng.gen_range(-1.0..1.0);
 
-                let mut rng = rand::thread_rng();
-                let x = rng.gen_range(-1.0..1.0);
-                let y = rng.gen_range(-1.0..1.0);
-                let z = rng.gen_range(-1.0..1.0);
+                    EMBEDDING_QUEUE.lock().unwrap().push(JsEmbedding {
+                        id: Uuid::new_v4().to_string(),
+                        position: [x, y, z],
+                    });
+                }
+            });
+    }
+}
 
-                let text = TextEmbedding {
-                    embedding: [x, y, z],
-                    drawn: false,
-                };
-
-                let mut queue = EMBEDDING_QUEUE.lock().unwrap();
-
-                queue.push(text.embedding)
-            }
-        });
+fn sync_rendered_embeddings_to_js(renderer_state: Res<RendererState>) {
+    if let Some(ref texts) = renderer_state.texts {
+        let mut export = RENDERED_EMBEDDINGS.lock().unwrap();
+        *export = texts.clone(); // clone into static buffer
+    }
 }
 
 fn draw_new_embeddings(
@@ -224,11 +263,12 @@ fn draw_new_embeddings(
     mut renderer_state: ResMut<RendererState>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut entity_map: ResMut<EmbeddingEntities>,
 ) {
     if let Some(texts) = &mut renderer_state.texts {
         for text in texts {
             if !text.drawn {
-                commands
+                let entity = commands
                     .spawn(PbrBundle {
                         mesh: meshes.add(Sphere::new(0.01).mesh()),
                         material: materials.add(StandardMaterial {
@@ -254,7 +294,7 @@ fn draw_new_embeddings(
                         ),
                         ..default()
                     })
-                    .insert(*text)
+                    .insert(text.clone())
                     .insert(On::<Pointer<Click>>::target_component_mut::<Transform>(
                         |_pos, transform| {
                             if transform.scale == Vec3::ONE {
@@ -263,10 +303,12 @@ fn draw_new_embeddings(
                                 transform.scale = Vec3::ONE
                             }
                         },
-                    ));
+                    ))
+                    .id();
 
+                entity_map.0.insert(text.id.clone(), entity);
                 text.drawn = true;
-            };
+            }
         }
     }
 }
@@ -290,11 +332,16 @@ fn blur_embeddings(
 
         // Update the material's opacity
         if let Some(material) = materials.get_mut(emb_material) {
-            info!("updating material. a: {}, mat: {:#?}", opacity, material);
             material.base_color.set_alpha(opacity);
             material.emissive.set_alpha(opacity);
         }
     }
+}
+
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_name = should_show_ui)]
+    fn should_show_ui() -> bool;
 }
 
 #[wasm_bindgen(start)]
@@ -315,11 +362,25 @@ pub fn run() {
         ))
         .add_plugins(DefaultPickingPlugins)
         .insert_resource(ClearColor(Color::NONE))
+        .insert_resource(EmbeddingEntities::default())
         .insert_resource(RendererState { texts: None })
         .insert_resource(EmbeddingQueueResource)
         .add_systems(Startup, startup)
         .add_systems(PreUpdate, process_new_embeddings)
-        .add_systems(Update, (update, draw_new_embeddings))
-        .add_systems(PostUpdate, blur_embeddings)
+        .add_systems(
+            Update,
+            (
+                update,
+                draw_new_embeddings,
+                process_delete_embedding_requests,
+            ),
+        )
+        .add_systems(
+            PostUpdate,
+            (
+                blur_embeddings,
+                sync_rendered_embeddings_to_js, // <- flush state to JS buffer
+            ),
+        )
         .run();
 }
