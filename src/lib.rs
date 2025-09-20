@@ -30,6 +30,10 @@ static EMBEDDING_QUEUE: Lazy<Mutex<Vec<JsEmbedding>>> = Lazy::new(|| Mutex::new(
 static DELETE_QUEUE: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
 static RENDERED_EMBEDDINGS: Lazy<Mutex<Vec<TextEmbedding>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
+// set to arbitrary handle, since this is the only "external" asset
+pub const LINE_SHADER_HANDLE: Handle<Shader> =
+    Handle::weak_from_u128(0xA3E0_9C7D_8B51_42C3_9F77_12AB_34CD_5678); // arbitrary hex
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsEmbedding {
     pub id: String,
@@ -80,7 +84,7 @@ struct LineMaterial {
 
 impl Material for LineMaterial {
     fn fragment_shader() -> ShaderRef {
-        "shaders/line_material.wgsl".into()
+        LINE_SHADER_HANDLE.clone().into()
     }
 
     fn specialize(
@@ -89,7 +93,6 @@ impl Material for LineMaterial {
         _layout: &MeshVertexBufferLayoutRef,
         _key: MaterialPipelineKey<Self>,
     ) -> Result<(), SpecializedMeshPipelineError> {
-        // Render as a line between vertices
         descriptor.primitive.polygon_mode = PolygonMode::Fill;
         Ok(())
     }
@@ -460,6 +463,13 @@ fn apply_selection_visuals(mut q: Query<(&mut Transform, Option<&Selected>), Wit
     }
 }
 
+fn register_internal_shader(mut shaders: ResMut<Assets<Shader>>) {
+    // path is relative to this file; adjust if you move things
+    let src = include_str!("../assets/shaders/line_material.wgsl");
+    let shader = Shader::from_wgsl(src, "embedded://line_material.wgsl");
+    shaders.insert(&LINE_SHADER_HANDLE, shader);
+}
+
 #[wasm_bindgen(start)]
 pub fn run() {
     App::new()
@@ -481,7 +491,7 @@ pub fn run() {
         .insert_resource(EmbeddingEntities::default())
         .insert_resource(RendererState { texts: None })
         .insert_resource(EmbeddingQueueResource)
-        .add_systems(Startup, (startup, log_window))
+        .add_systems(Startup, (register_internal_shader, startup, log_window))
         .add_systems(PreUpdate, process_new_embeddings)
         .add_systems(
             Update,
