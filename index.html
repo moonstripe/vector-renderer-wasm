@@ -44,7 +44,7 @@
         add_embedding,
         delete_embedding_by_id,
         get_embeddings
-      } from "./wasm/vector-renderer.js";
+      } from "./pkg/vector_renderer.js";
 
       if (typeof window.should_show_ui !== "function") {
         window.should_show_ui = () => false; // default to hiding the UI

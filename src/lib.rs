@@ -1,4 +1,5 @@
 use core::f32;
+use core::f32::consts::FRAC_PI_2;
 
 use bevy::{
     pbr::{MaterialPipeline, MaterialPipelineKey},
@@ -12,9 +13,9 @@ use bevy::{
             SpecializedMeshPipelineError,
         },
     },
+    window::PrimaryWindow,
 };
 use bevy_egui::{egui, EguiContexts, EguiPlugin};
-use bevy_mod_picking::prelude::*;
 use bevy_panorbit_camera::{PanOrbitCamera, PanOrbitCameraPlugin};
 use once_cell::sync::Lazy;
 use rand::Rng;
@@ -68,6 +69,9 @@ struct TextEmbedding {
     drawn: bool,
 }
 
+#[derive(Component)]
+struct Selected;
+
 #[derive(Asset, TypePath, Default, AsBindGroup, Debug, Clone)]
 struct LineMaterial {
     #[uniform(0)]
@@ -85,7 +89,7 @@ impl Material for LineMaterial {
         _layout: &MeshVertexBufferLayoutRef,
         _key: MaterialPipelineKey<Self>,
     ) -> Result<(), SpecializedMeshPipelineError> {
-        // This is the important part to tell bevy to render this material as a line between vertices
+        // Render as a line between vertices
         descriptor.primitive.polygon_mode = PolygonMode::Fill;
         Ok(())
     }
@@ -110,12 +114,10 @@ impl From<Axis> for Mesh {
         let vertices = axis.line.to_vec();
 
         Mesh::new(
-            // This tells wgpu that the positions are list of lines
-            // where every pair is a start and end point
+            // Line list: every pair is a start/end point
             PrimitiveTopology::LineList,
             RenderAssetUsages::RENDER_WORLD,
         )
-        // Add the vertices positions as an attribute
         .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, vertices)
     }
 }
@@ -151,12 +153,9 @@ fn process_delete_embedding_requests(
 
     if let Some(texts) = &mut renderer_state.texts {
         for id in queue.drain(..) {
-            // Remove entity from world if present
             if let Some(entity) = entity_map.0.remove(&id) {
-                commands.entity(entity).despawn_recursive(); // despawn associated entity
+                commands.entity(entity).despawn_recursive();
             }
-
-            // Remove from texts
             texts.retain(|t| t.id != id);
         }
     }
@@ -173,8 +172,25 @@ fn startup(
             ..default()
         },
         PanOrbitCamera {
-            zoom_upper_limit: Some(5.0),
-            zoom_lower_limit: Some(1.0),
+            // turn off auto “uprighting”; avoids the snap you’re calling “sticky up”
+            allow_upside_down: true,
+
+            // don’t let pitch reach the pole (numerical hell lives there)
+            pitch_upper_limit: Some(FRAC_PI_2 - 0.01), // ~+89°
+            pitch_lower_limit: Some(-FRAC_PI_2 + 0.01), // ~−89°
+
+            // slow the controller way down so “too fast” isn’t your debug problem
+            orbit_sensitivity: 5.0,
+            pan_sensitivity: 0.0,
+            zoom_sensitivity: 0.22,
+            orbit_smoothness: 0.06,
+            pan_smoothness: 0.00,
+            zoom_smoothness: 0.06,
+
+            // sensible zoom bounds for your scene scale
+            zoom_lower_limit: Some(0.5),
+            zoom_upper_limit: Some(1.5),
+
             ..default()
         },
     ));
@@ -254,7 +270,7 @@ fn update(mut contexts: EguiContexts, renderer_state: Res<RendererState>) {
 fn sync_rendered_embeddings_to_js(renderer_state: Res<RendererState>) {
     if let Some(ref texts) = renderer_state.texts {
         let mut export = RENDERED_EMBEDDINGS.lock().unwrap();
-        *export = texts.clone(); // clone into static buffer
+        *export = texts.clone();
     }
 }
 
@@ -295,15 +311,6 @@ fn draw_new_embeddings(
                         ..default()
                     })
                     .insert(text.clone())
-                    .insert(On::<Pointer<Click>>::target_component_mut::<Transform>(
-                        |_pos, transform| {
-                            if transform.scale == Vec3::ONE {
-                                transform.scale *= 3.;
-                            } else {
-                                transform.scale = Vec3::ONE
-                            }
-                        },
-                    ))
                     .id();
 
                 entity_map.0.insert(text.id.clone(), entity);
@@ -323,14 +330,12 @@ fn blur_embeddings(
     for (&emb_transform, emb_material) in emb_query.iter_mut() {
         let depth = (camera_transform.translation - emb_transform.translation).length();
 
-        // Steeper drop-off curve
         let opacity = if depth >= 5.0 {
             0.1
         } else {
             1.0 - (depth / 5.0) * 0.9
         };
 
-        // Update the material's opacity
         if let Some(material) = materials.get_mut(emb_material) {
             material.base_color.set_alpha(opacity);
             material.emissive.set_alpha(opacity);
@@ -342,6 +347,117 @@ fn blur_embeddings(
 extern "C" {
     #[wasm_bindgen(js_name = should_show_ui)]
     fn should_show_ui() -> bool;
+}
+
+fn log_window(window_q: Query<&Window, With<PrimaryWindow>>) {
+    let w = window_q.single();
+    info!(
+        "logical={}x{}, physical={}x{}, scale_factor={}",
+        w.width(),
+        w.height(),
+        w.physical_width(),
+        w.physical_height(),
+        w.scale_factor()
+    );
+}
+
+/// Selection radius in world units around each embedding center.
+/// This is larger than the sphere mesh radius (0.01) to make selection practical.
+const SELECTION_RADIUS: f32 = 0.03;
+
+/// Returns the shortest distance from a ray to a point in space.
+fn distance_ray_to_point(ray: &Ray3d, point: Vec3) -> f32 {
+    // |(p0 - point) x d|, where p0 is ray origin and d is unit ray direction
+    (ray.origin - point).cross(ray.direction.as_vec3()).length()
+}
+
+/// Casts a ray from the cursor and selects the nearest embedding within SELECTION_RADIUS.
+fn select_embedding_on_click(
+    buttons: Res<ButtonInput<MouseButton>>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    cam_q: Query<(&Camera, &GlobalTransform)>,
+    mut q_embeddings: Query<(Entity, &Transform, &TextEmbedding, Option<&Selected>)>,
+    mut commands: Commands,
+) {
+    // Only act on fresh click
+    if !buttons.just_pressed(MouseButton::Left) {
+        return;
+    }
+
+    let window = windows.single();
+    let Some(cursor_pos) = window.cursor_position() else {
+        return;
+    };
+
+    let (camera, cam_xform) = cam_q.single();
+
+    let Some(ray) = camera.viewport_to_world(cam_xform, cursor_pos) else {
+        return;
+    };
+
+    // Find closest embedding within threshold
+    let mut best: Option<(Entity, f32)> = None;
+
+    for (entity, transform, _emb, _sel) in q_embeddings.iter_mut() {
+        let center = transform.translation;
+        let d = distance_ray_to_point(&ray, center);
+
+        if d <= SELECTION_RADIUS {
+            // Use distance along the ray to prefer the front-most hit
+            let along = (center - ray.origin).dot(*ray.direction).max(0.0);
+            match best {
+                None => best = Some((entity, along)),
+                Some((_e, best_along)) if along < best_along => best = Some((entity, along)),
+                _ => {}
+            }
+        }
+    }
+
+    // If nothing is close enough, clear selection
+    if best.is_none() {
+        // remove Selected from all
+        for (entity, _, _, maybe_sel) in q_embeddings.iter_mut() {
+            if maybe_sel.is_some() {
+                commands.entity(entity).remove::<Selected>();
+            }
+        }
+        return;
+    }
+
+    let (winner, _) = best.unwrap();
+
+    // Toggle semantics: if the winner is already selected, unselect it. Otherwise, select it and unselect others.
+    let mut winner_was_selected = false;
+    for (entity, _, _, maybe_sel) in q_embeddings.iter_mut() {
+        if entity == winner && maybe_sel.is_some() {
+            winner_was_selected = true;
+        }
+    }
+
+    if winner_was_selected {
+        commands.entity(winner).remove::<Selected>();
+    } else {
+        // clear others
+        for (entity, _, _, maybe_sel) in q_embeddings.iter_mut() {
+            if maybe_sel.is_some() && entity != winner {
+                commands.entity(entity).remove::<Selected>();
+            }
+        }
+        // set winner
+        commands.entity(winner).insert(Selected);
+    }
+}
+
+/// Visually reflects selection by scaling selected embeddings up, others to normal.
+fn apply_selection_visuals(mut q: Query<(&mut Transform, Option<&Selected>), With<TextEmbedding>>) {
+    for (mut transform, maybe_sel) in q.iter_mut() {
+        if maybe_sel.is_some() {
+            // match previous behavior: x3 when selected
+            transform.scale = Vec3::splat(3.0);
+        } else {
+            transform.scale = Vec3::ONE;
+        }
+    }
 }
 
 #[wasm_bindgen(start)]
@@ -359,13 +475,13 @@ pub fn run() {
             MaterialPlugin::<LineMaterial>::default(),
             PanOrbitCameraPlugin,
             EguiPlugin,
+            // bevy_mod_picking removed
         ))
-        .add_plugins(DefaultPickingPlugins)
         .insert_resource(ClearColor(Color::NONE))
         .insert_resource(EmbeddingEntities::default())
         .insert_resource(RendererState { texts: None })
         .insert_resource(EmbeddingQueueResource)
-        .add_systems(Startup, startup)
+        .add_systems(Startup, (startup, log_window))
         .add_systems(PreUpdate, process_new_embeddings)
         .add_systems(
             Update,
@@ -373,14 +489,13 @@ pub fn run() {
                 update,
                 draw_new_embeddings,
                 process_delete_embedding_requests,
+                select_embedding_on_click, // <— new selection handler
+                apply_selection_visuals,   // <— visual scaling for selection
             ),
         )
         .add_systems(
             PostUpdate,
-            (
-                blur_embeddings,
-                sync_rendered_embeddings_to_js, // <- flush state to JS buffer
-            ),
+            (blur_embeddings, sync_rendered_embeddings_to_js),
         )
         .run();
 }
