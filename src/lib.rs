@@ -26,9 +26,13 @@ use wasm_bindgen::prelude::*;
 
 const AXIS_LENGTH: f32 = 500.;
 
+// Center of the [0,1] volume - camera will focus here
+const VOLUME_CENTER: Vec3 = Vec3::new(0.5, 0.5, 0.5);
+
 static EMBEDDING_QUEUE: Lazy<Mutex<Vec<JsEmbedding>>> = Lazy::new(|| Mutex::new(Vec::new()));
 static DELETE_QUEUE: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
 static RENDERED_EMBEDDINGS: Lazy<Mutex<Vec<TextEmbedding>>> = Lazy::new(|| Mutex::new(Vec::new()));
+static SELECTED_EMBEDDING_ID: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
 
 // set to arbitrary handle, since this is the only "external" asset
 pub const LINE_SHADER_HANDLE: Handle<Shader> =
@@ -64,6 +68,18 @@ pub fn get_embeddings() -> JsValue {
 #[wasm_bindgen]
 pub fn delete_embedding_by_id(id: String) {
     DELETE_QUEUE.lock().unwrap().push(id);
+}
+
+/// Get the currently selected embedding ID (if any)
+#[wasm_bindgen]
+pub fn get_selected_id() -> Option<String> {
+    SELECTED_EMBEDDING_ID.lock().unwrap().clone()
+}
+
+/// Clear the selection
+#[wasm_bindgen]
+pub fn clear_selection() {
+    *SELECTED_EMBEDDING_ID.lock().unwrap() = None;
 }
 
 #[derive(Component, Debug, Clone, Serialize, Deserialize)]
@@ -169,20 +185,28 @@ fn startup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut line_materials: ResMut<Assets<LineMaterial>>,
 ) {
+    // Light gray for axes - high contrast on dark background
+    let axis_rgba = LinearRgba::new(0.7, 0.7, 0.7, 1.0);
+
     commands.spawn((
         Camera3dBundle {
-            transform: Transform::from_translation(Vec3::new(0.0, 1.5, 5.0)),
+            // Position camera to look at center of [0,1] volume
+            transform: Transform::from_translation(VOLUME_CENTER + Vec3::new(0.0, 1.0, 2.5))
+                .looking_at(VOLUME_CENTER, Vec3::Y),
             ..default()
         },
         PanOrbitCamera {
-            // turn off auto “uprighting”; avoids the snap you’re calling “sticky up”
+            // Focus on center of volume
+            focus: VOLUME_CENTER,
+
+            // turn off auto "uprighting"; avoids the snap you're calling "sticky up"
             allow_upside_down: true,
 
-            // don’t let pitch reach the pole (numerical hell lives there)
+            // don't let pitch reach the pole (numerical hell lives there)
             pitch_upper_limit: Some(FRAC_PI_2 - 0.01), // ~+89°
             pitch_lower_limit: Some(-FRAC_PI_2 + 0.01), // ~−89°
 
-            // slow the controller way down so “too fast” isn’t your debug problem
+            // slow the controller way down so "too fast" isn't your debug problem
             orbit_sensitivity: 5.0,
             pan_sensitivity: 0.0,
             zoom_sensitivity: 0.22,
@@ -192,29 +216,29 @@ fn startup(
 
             // sensible zoom bounds for your scene scale
             zoom_lower_limit: Some(0.5),
-            zoom_upper_limit: Some(1.5),
+            zoom_upper_limit: Some(5.0),
 
             ..default()
         },
     ));
 
-    // Define axes
-    let origin = Vec3::new(0., 0., 0.);
+    // Define axes - starting from origin, extending along each axis
+    let origin = Vec3::ZERO;
     let x_axis_end = Vec3::X * AXIS_LENGTH;
     let y_axis_end = Vec3::Y * AXIS_LENGTH;
     let z_axis_end = Vec3::Z * AXIS_LENGTH;
 
     let x_axis = Axis {
         line: [origin, x_axis_end],
-        color: LinearRgba::RED,
+        color: axis_rgba,
     };
     let y_axis = Axis {
         line: [origin, y_axis_end],
-        color: LinearRgba::GREEN,
+        color: axis_rgba,
     };
     let z_axis = Axis {
         line: [origin, z_axis_end],
-        color: LinearRgba::BLUE,
+        color: axis_rgba,
     };
 
     // Spawn X Axis
@@ -284,6 +308,9 @@ fn draw_new_embeddings(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut entity_map: ResMut<EmbeddingEntities>,
 ) {
+    // White for embeddings - high contrast on dark background
+    let emb_color = [1.0_f32, 1.0, 1.0, 1.0];
+
     if let Some(texts) = &mut renderer_state.texts {
         for text in texts {
             if !text.drawn {
@@ -292,16 +319,16 @@ fn draw_new_embeddings(
                         mesh: meshes.add(Sphere::new(0.01).mesh()),
                         material: materials.add(StandardMaterial {
                             base_color: Color::srgba(
-                                text.embedding[0],
-                                text.embedding[1],
-                                text.embedding[2],
-                                1.0,
+                                emb_color[0],
+                                emb_color[1],
+                                emb_color[2],
+                                emb_color[3],
                             ),
                             emissive: LinearRgba::new(
-                                text.embedding[0],
-                                text.embedding[1],
-                                text.embedding[2],
-                                1.0,
+                                emb_color[0],
+                                emb_color[1],
+                                emb_color[2],
+                                emb_color[3],
                             ),
                             alpha_mode: AlphaMode::Blend,
                             ..default()
@@ -424,6 +451,8 @@ fn select_embedding_on_click(
                 commands.entity(entity).remove::<Selected>();
             }
         }
+        // Clear JS-accessible selection
+        *SELECTED_EMBEDDING_ID.lock().unwrap() = None;
         return;
     }
 
@@ -439,6 +468,8 @@ fn select_embedding_on_click(
 
     if winner_was_selected {
         commands.entity(winner).remove::<Selected>();
+        // Clear selection in JS-accessible static
+        *SELECTED_EMBEDDING_ID.lock().unwrap() = None;
     } else {
         // clear others
         for (entity, _, _, maybe_sel) in q_embeddings.iter_mut() {
@@ -448,6 +479,13 @@ fn select_embedding_on_click(
         }
         // set winner
         commands.entity(winner).insert(Selected);
+        // Update JS-accessible static with selected ID
+        for (entity, _, emb, _) in q_embeddings.iter() {
+            if entity == winner {
+                *SELECTED_EMBEDDING_ID.lock().unwrap() = Some(emb.id.clone());
+                break;
+            }
+        }
     }
 }
 
@@ -478,6 +516,7 @@ pub fn run() {
                 primary_window: Some(Window {
                     title: "Vector Renderer Test".to_string(),
                     canvas: Some("#vector-canvas".into()),
+                    fit_canvas_to_parent: true,
                     ..Default::default()
                 }),
                 ..Default::default()
