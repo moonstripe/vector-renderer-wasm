@@ -24,6 +24,41 @@ use std::sync::Mutex;
 use uuid::Uuid;
 use wasm_bindgen::prelude::*;
 
+// ---------------------------------------------------------------------------
+// Firefox / Gecko wheel-event normalisation
+// ---------------------------------------------------------------------------
+// Firefox reports wheel events with deltaMode=1 (DOM_DELTA_LINE) while
+// Chromium uses deltaMode=0 (DOM_DELTA_PIXEL). Winit passes these through
+// as different enum variants, and bevy_panorbit_camera applies different
+// scaling to each — resulting in ~2.5× faster zoom on Firefox.
+//
+// We fix this at the JS level by patching incoming wheel events *in-place*
+// (via Object.defineProperty) before winit's own listener fires. This keeps
+// all Rust-side sensitivity values browser-agnostic.
+// See: https://github.com/moonstripe/indra_net/issues/6
+// ---------------------------------------------------------------------------
+#[wasm_bindgen(inline_js = "
+export function install_gecko_wheel_fix(canvas_selector) {
+    const PIXELS_PER_LINE = 20;
+    const canvas = document.querySelector(canvas_selector);
+    if (!canvas) return;
+
+    canvas.addEventListener('wheel', function(e) {
+        // deltaMode 1 = DOM_DELTA_LINE  (Firefox default)
+        // deltaMode 0 = DOM_DELTA_PIXEL (Chrome default)
+        if (e.deltaMode === 1) {
+            Object.defineProperty(e, 'deltaMode', { value: 0 });
+            Object.defineProperty(e, 'deltaX',    { value: e.deltaX * PIXELS_PER_LINE });
+            Object.defineProperty(e, 'deltaY',    { value: e.deltaY * PIXELS_PER_LINE });
+            Object.defineProperty(e, 'deltaZ',    { value: e.deltaZ * PIXELS_PER_LINE });
+        }
+    }, { capture: true });   // capture phase → fires before winit's handler
+}
+")]
+extern "C" {
+    fn install_gecko_wheel_fix(canvas_selector: &str);
+}
+
 const AXIS_LENGTH: f32 = 500.;
 
 // Center of the [0,1] volume - camera will focus here
@@ -206,7 +241,7 @@ fn startup(
             pitch_upper_limit: Some(FRAC_PI_2 - 0.01), // ~+89°
             pitch_lower_limit: Some(-FRAC_PI_2 + 0.01), // ~−89°
 
-            // slow the controller way down so "too fast" isn't your debug problem
+            // Tuned for the [0,1] volume scene scale
             orbit_sensitivity: 5.0,
             pan_sensitivity: 0.0,
             zoom_sensitivity: 0.22,
@@ -510,6 +545,9 @@ fn register_internal_shader(mut shaders: ResMut<Assets<Shader>>) {
 
 #[wasm_bindgen(start)]
 pub fn run() {
+    // Patch Firefox wheel events before Bevy/winit registers its own listeners.
+    install_gecko_wheel_fix("#vector-canvas");
+
     App::new()
         .add_plugins((
             DefaultPlugins.set(WindowPlugin {
