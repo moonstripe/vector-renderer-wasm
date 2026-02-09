@@ -16,7 +16,7 @@ use bevy::{
     window::PrimaryWindow,
 };
 use bevy_egui::{egui, EguiContexts, EguiPlugin};
-use bevy_panorbit_camera::{PanOrbitCamera, PanOrbitCameraPlugin};
+use bevy_panorbit_camera::{PanOrbitCamera, PanOrbitCameraPlugin, TouchControls};
 use once_cell::sync::Lazy;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -66,7 +66,10 @@ const VOLUME_CENTER: Vec3 = Vec3::new(0.5, 0.5, 0.5);
 
 static EMBEDDING_QUEUE: Lazy<Mutex<Vec<JsEmbedding>>> = Lazy::new(|| Mutex::new(Vec::new()));
 static DELETE_QUEUE: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
+static EDGE_QUEUE: Lazy<Mutex<Vec<JsEdge>>> = Lazy::new(|| Mutex::new(Vec::new()));
+static EDGE_DELETE_QUEUE: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
 static RENDERED_EMBEDDINGS: Lazy<Mutex<Vec<TextEmbedding>>> = Lazy::new(|| Mutex::new(Vec::new()));
+static RENDERED_EDGES: Lazy<Mutex<Vec<RenderedEdge>>> = Lazy::new(|| Mutex::new(Vec::new()));
 static SELECTED_EMBEDDING_ID: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
 
 // set to arbitrary handle, since this is the only "external" asset
@@ -77,6 +80,22 @@ pub const LINE_SHADER_HANDLE: Handle<Shader> =
 pub struct JsEmbedding {
     pub id: String,
     pub position: [f32; 3],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JsEdge {
+    pub id: String,
+    pub from: [f32; 3],
+    pub to: [f32; 3],
+    pub color: Option<[f32; 4]>, // RGBA, optional - defaults to gray
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RenderedEdge {
+    id: String,
+    from: [f32; 3],
+    to: [f32; 3],
+    drawn: bool,
 }
 
 #[derive(Resource)]
@@ -92,6 +111,61 @@ pub fn add_embedding(x: f32, y: f32, z: f32) -> String {
     EMBEDDING_QUEUE.lock().unwrap().push(embedding.clone());
 
     embedding.id
+}
+
+/// Add an edge (line) between two 3D positions
+/// Returns the edge ID
+#[wasm_bindgen]
+pub fn add_edge(from_x: f32, from_y: f32, from_z: f32, to_x: f32, to_y: f32, to_z: f32) -> String {
+    let edge = JsEdge {
+        id: Uuid::new_v4().to_string(),
+        from: [from_x, from_y, from_z],
+        to: [to_x, to_y, to_z],
+        color: None,
+    };
+
+    EDGE_QUEUE.lock().unwrap().push(edge.clone());
+
+    edge.id
+}
+
+/// Add an edge with a custom color (RGBA, each component 0.0-1.0)
+#[wasm_bindgen]
+pub fn add_edge_with_color(
+    from_x: f32,
+    from_y: f32,
+    from_z: f32,
+    to_x: f32,
+    to_y: f32,
+    to_z: f32,
+    r: f32,
+    g: f32,
+    b: f32,
+    a: f32,
+) -> String {
+    let edge = JsEdge {
+        id: Uuid::new_v4().to_string(),
+        from: [from_x, from_y, from_z],
+        to: [to_x, to_y, to_z],
+        color: Some([r, g, b, a]),
+    };
+
+    EDGE_QUEUE.lock().unwrap().push(edge.clone());
+
+    edge.id
+}
+
+/// Delete an edge by ID
+#[wasm_bindgen]
+pub fn delete_edge_by_id(id: String) {
+    EDGE_DELETE_QUEUE.lock().unwrap().push(id);
+}
+
+/// Get all rendered edges
+#[wasm_bindgen]
+pub fn get_edges() -> JsValue {
+    let export = RENDERED_EDGES.lock().unwrap();
+    serde_wasm_bindgen::to_value(&*export).unwrap_or(JsValue::NULL)
 }
 
 #[wasm_bindgen]
@@ -127,6 +201,12 @@ struct TextEmbedding {
 #[derive(Component)]
 struct Selected;
 
+/// Component to mark edge entities
+#[derive(Component)]
+struct EdgeEntity {
+    id: String,
+}
+
 #[derive(Asset, TypePath, Default, AsBindGroup, Debug, Clone)]
 struct LineMaterial {
     #[uniform(0)]
@@ -158,10 +238,14 @@ struct Axis {
 #[derive(Debug, Clone, Resource)]
 struct RendererState {
     texts: Option<Vec<TextEmbedding>>,
+    edges: Option<Vec<RenderedEdge>>,
 }
 
 #[derive(Resource, Default)]
 struct EmbeddingEntities(pub std::collections::HashMap<String, Entity>);
+
+#[derive(Resource, Default)]
+struct EdgeEntities(pub std::collections::HashMap<String, Entity>);
 
 impl From<Axis> for Mesh {
     fn from(axis: Axis) -> Self {
@@ -198,6 +282,29 @@ fn process_new_embeddings(mut renderer_state: ResMut<RendererState>) {
     };
 }
 
+fn process_new_edges(mut renderer_state: ResMut<RendererState>) {
+    match EDGE_QUEUE.try_lock() {
+        Ok(mut queue) => {
+            for edge in queue.drain(..) {
+                let rendered = RenderedEdge {
+                    id: edge.id,
+                    from: edge.from,
+                    to: edge.to,
+                    drawn: false,
+                };
+                if let Some(edges) = &mut renderer_state.edges {
+                    edges.push(rendered);
+                } else {
+                    renderer_state.edges = Some(vec![rendered]);
+                }
+            }
+        }
+        Err(e) => {
+            warn!("could not get edge lock... {:#?}", e);
+        }
+    };
+}
+
 fn process_delete_embedding_requests(
     mut renderer_state: ResMut<RendererState>,
     mut entity_map: ResMut<EmbeddingEntities>,
@@ -211,6 +318,23 @@ fn process_delete_embedding_requests(
                 commands.entity(entity).despawn_recursive();
             }
             texts.retain(|t| t.id != id);
+        }
+    }
+}
+
+fn process_delete_edge_requests(
+    mut renderer_state: ResMut<RendererState>,
+    mut edge_map: ResMut<EdgeEntities>,
+    mut commands: Commands,
+) {
+    let mut queue = EDGE_DELETE_QUEUE.lock().unwrap();
+
+    if let Some(edges) = &mut renderer_state.edges {
+        for id in queue.drain(..) {
+            if let Some(entity) = edge_map.0.remove(&id) {
+                commands.entity(entity).despawn_recursive();
+            }
+            edges.retain(|e| e.id != id);
         }
     }
 }
@@ -252,6 +376,10 @@ fn startup(
             // sensible zoom bounds for your scene scale
             zoom_lower_limit: Some(0.5),
             zoom_upper_limit: Some(5.0),
+
+            // Enable touch controls: one finger orbit, two finger pinch to zoom
+            touch_enabled: true,
+            touch_controls: TouchControls::OneFingerOrbit,
 
             ..default()
         },
@@ -336,6 +464,13 @@ fn sync_rendered_embeddings_to_js(renderer_state: Res<RendererState>) {
     }
 }
 
+fn sync_rendered_edges_to_js(renderer_state: Res<RendererState>) {
+    if let Some(ref edges) = renderer_state.edges {
+        let mut export = RENDERED_EDGES.lock().unwrap();
+        *export = edges.clone();
+    }
+}
+
 fn draw_new_embeddings(
     mut commands: Commands,
     mut renderer_state: ResMut<RendererState>,
@@ -380,6 +515,48 @@ fn draw_new_embeddings(
 
                 entity_map.0.insert(text.id.clone(), entity);
                 text.drawn = true;
+            }
+        }
+    }
+}
+
+/// Draw edges as 3D lines
+fn draw_new_edges(
+    mut commands: Commands,
+    mut renderer_state: ResMut<RendererState>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut line_materials: ResMut<Assets<LineMaterial>>,
+    mut edge_map: ResMut<EdgeEntities>,
+) {
+    // Default edge color - semi-transparent gray
+    let default_color = LinearRgba::new(0.5, 0.5, 0.5, 0.6);
+
+    if let Some(edges) = &mut renderer_state.edges {
+        for edge in edges {
+            if !edge.drawn {
+                let from = Vec3::new(edge.from[0], edge.from[1], edge.from[2]);
+                let to = Vec3::new(edge.to[0], edge.to[1], edge.to[2]);
+
+                // Create line mesh
+                let line_mesh =
+                    Mesh::new(PrimitiveTopology::LineList, RenderAssetUsages::RENDER_WORLD)
+                        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, vec![from, to]);
+
+                let entity = commands
+                    .spawn(MaterialMeshBundle {
+                        mesh: meshes.add(line_mesh),
+                        material: line_materials.add(LineMaterial {
+                            color: default_color,
+                        }),
+                        ..default()
+                    })
+                    .insert(EdgeEntity {
+                        id: edge.id.clone(),
+                    })
+                    .id();
+
+                edge_map.0.insert(edge.id.clone(), entity);
+                edge.drawn = true;
             }
         }
     }
@@ -430,33 +607,31 @@ fn log_window(window_q: Query<&Window, With<PrimaryWindow>>) {
 /// This is larger than the sphere mesh radius (0.01) to make selection practical.
 const SELECTION_RADIUS: f32 = 0.03;
 
+/// Tolerance for tap vs drag detection (in pixels)
+const TAP_TOLERANCE: f32 = 10.0;
+
+/// Resource to track touch start position for tap detection
+#[derive(Resource, Default)]
+struct TouchTapTracker {
+    start_position: Option<Vec2>,
+    touch_id: Option<u64>,
+}
+
 /// Returns the shortest distance from a ray to a point in space.
 fn distance_ray_to_point(ray: &Ray3d, point: Vec3) -> f32 {
     // |(p0 - point) x d|, where p0 is ray origin and d is unit ray direction
     (ray.origin - point).cross(ray.direction.as_vec3()).length()
 }
 
-/// Casts a ray from the cursor and selects the nearest embedding within SELECTION_RADIUS.
-fn select_embedding_on_click(
-    buttons: Res<ButtonInput<MouseButton>>,
-    windows: Query<&Window, With<PrimaryWindow>>,
-    cam_q: Query<(&Camera, &GlobalTransform)>,
-    mut q_embeddings: Query<(Entity, &Transform, &TextEmbedding, Option<&Selected>)>,
-    mut commands: Commands,
+/// Helper function to perform selection at a given screen position
+fn select_at_position(
+    position: Vec2,
+    camera: &Camera,
+    cam_xform: &GlobalTransform,
+    q_embeddings: &mut Query<(Entity, &Transform, &TextEmbedding, Option<&Selected>)>,
+    commands: &mut Commands,
 ) {
-    // Only act on fresh click
-    if !buttons.just_pressed(MouseButton::Left) {
-        return;
-    }
-
-    let window = windows.single();
-    let Some(cursor_pos) = window.cursor_position() else {
-        return;
-    };
-
-    let (camera, cam_xform) = cam_q.single();
-
-    let Some(ray) = camera.viewport_to_world(cam_xform, cursor_pos) else {
+    let Some(ray) = camera.viewport_to_world(cam_xform, position) else {
         return;
     };
 
@@ -524,6 +699,113 @@ fn select_embedding_on_click(
     }
 }
 
+/// Casts a ray from the cursor and selects the nearest embedding within SELECTION_RADIUS.
+fn select_embedding_on_click(
+    buttons: Res<ButtonInput<MouseButton>>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    cam_q: Query<(&Camera, &GlobalTransform)>,
+    mut q_embeddings: Query<(Entity, &Transform, &TextEmbedding, Option<&Selected>)>,
+    mut commands: Commands,
+) {
+    // Only act on fresh click
+    if !buttons.just_pressed(MouseButton::Left) {
+        return;
+    }
+
+    let window = windows.single();
+    let Some(cursor_pos) = window.cursor_position() else {
+        return;
+    };
+
+    let (camera, cam_xform) = cam_q.single();
+    select_at_position(
+        cursor_pos,
+        camera,
+        cam_xform,
+        &mut q_embeddings,
+        &mut commands,
+    );
+}
+
+/// Track touch start/end for tap detection and selection on mobile
+fn select_embedding_on_tap(
+    touches: Res<Touches>,
+    mut tap_tracker: ResMut<TouchTapTracker>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    cam_q: Query<(&Camera, &GlobalTransform)>,
+    mut q_embeddings: Query<(Entity, &Transform, &TextEmbedding, Option<&Selected>)>,
+    mut commands: Commands,
+) {
+    // Track new touch starts
+    for touch in touches.iter_just_pressed() {
+        // Only track single finger taps
+        if touches.iter().count() == 1 {
+            tap_tracker.start_position = Some(touch.position());
+            tap_tracker.touch_id = Some(touch.id());
+        } else {
+            // Multi-touch, cancel tap tracking
+            tap_tracker.start_position = None;
+            tap_tracker.touch_id = None;
+        }
+    }
+
+    // Check for touch end (tap completion)
+    for touch in touches.iter_just_released() {
+        if let (Some(start_pos), Some(tracked_id)) =
+            (tap_tracker.start_position, tap_tracker.touch_id)
+        {
+            if touch.id() == tracked_id {
+                let end_pos = touch.position();
+                let distance = start_pos.distance(end_pos);
+
+                // If finger didn't move much, treat as a tap
+                if distance < TAP_TOLERANCE {
+                    let Ok(window) = windows.get_single() else {
+                        tap_tracker.start_position = None;
+                        tap_tracker.touch_id = None;
+                        continue;
+                    };
+
+                    // Check if touch is within window bounds
+                    if end_pos.x >= 0.0
+                        && end_pos.x <= window.width()
+                        && end_pos.y >= 0.0
+                        && end_pos.y <= window.height()
+                    {
+                        let (camera, cam_xform) = cam_q.single();
+                        select_at_position(
+                            end_pos,
+                            camera,
+                            cam_xform,
+                            &mut q_embeddings,
+                            &mut commands,
+                        );
+                    }
+                }
+            }
+        }
+
+        // Clear tracker after any touch release
+        tap_tracker.start_position = None;
+        tap_tracker.touch_id = None;
+    }
+
+    // Cancel tap if finger moves too much during the touch
+    if let (Some(start_pos), Some(tracked_id)) = (tap_tracker.start_position, tap_tracker.touch_id)
+    {
+        for touch in touches.iter() {
+            if touch.id() == tracked_id {
+                let current_pos = touch.position();
+                if start_pos.distance(current_pos) > TAP_TOLERANCE {
+                    // User is dragging, not tapping
+                    tap_tracker.start_position = None;
+                    tap_tracker.touch_id = None;
+                }
+            }
+        }
+    }
+}
+
 /// Visually reflects selection by scaling selected embeddings up, others to normal.
 fn apply_selection_visuals(mut q: Query<(&mut Transform, Option<&Selected>), With<TextEmbedding>>) {
     for (mut transform, maybe_sel) in q.iter_mut() {
@@ -566,23 +848,35 @@ pub fn run() {
         ))
         .insert_resource(ClearColor(Color::NONE))
         .insert_resource(EmbeddingEntities::default())
-        .insert_resource(RendererState { texts: None })
+        .insert_resource(EdgeEntities::default())
+        .insert_resource(RendererState {
+            texts: None,
+            edges: None,
+        })
         .insert_resource(EmbeddingQueueResource)
+        .insert_resource(TouchTapTracker::default())
         .add_systems(Startup, (register_internal_shader, startup, log_window))
-        .add_systems(PreUpdate, process_new_embeddings)
+        .add_systems(PreUpdate, (process_new_embeddings, process_new_edges))
         .add_systems(
             Update,
             (
                 update,
                 draw_new_embeddings,
+                draw_new_edges,
                 process_delete_embedding_requests,
-                select_embedding_on_click, // <— new selection handler
-                apply_selection_visuals,   // <— visual scaling for selection
+                process_delete_edge_requests,
+                select_embedding_on_click, // Mouse selection handler
+                select_embedding_on_tap,   // Touch/tap selection handler
+                apply_selection_visuals,   // Visual scaling for selection
             ),
         )
         .add_systems(
             PostUpdate,
-            (blur_embeddings, sync_rendered_embeddings_to_js),
+            (
+                blur_embeddings,
+                sync_rendered_embeddings_to_js,
+                sync_rendered_edges_to_js,
+            ),
         )
         .run();
 }
