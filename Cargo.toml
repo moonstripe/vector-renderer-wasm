@@ -7,7 +7,17 @@ edition = "2021"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-bevy = "0.14.0"
+bevy = { version = "0.14.0", default-features = false, features = [
+  "bevy_asset",
+  "bevy_winit",
+  "bevy_core_pipeline",
+  "bevy_pbr",
+  "bevy_render",
+  "bevy_text",
+  "bevy_ui",
+  "multi_threaded",
+  "webgl2",
+] }
 bevy_egui = { version = "0.28.0", default-features = false, features = [
   "render",
   "default_fonts",
@@ -26,3 +36,12 @@ wasm-bindgen = { version = "0.2.92", features = ["serde-serialize"] }
 [target.wasm32-unknown-unknown]
 runner = "wasm-server-runner"
 rustflags = ["--cfg=web_sys_unstable_apis"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false

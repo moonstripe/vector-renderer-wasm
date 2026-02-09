@@ -7,11 +7,13 @@ use bevy::{
     reflect::TypePath,
     render::{
         mesh::{MeshVertexBufferLayoutRef, PrimitiveTopology},
+        primitives::Aabb,
         render_asset::RenderAssetUsages,
         render_resource::{
             AsBindGroup, PolygonMode, RenderPipelineDescriptor, ShaderRef,
             SpecializedMeshPipelineError,
         },
+        view::NoFrustumCulling,
     },
     window::PrimaryWindow,
 };
@@ -27,16 +29,6 @@ use wasm_bindgen::prelude::*;
 // ---------------------------------------------------------------------------
 // Firefox / Gecko wheel-event normalisation
 // ---------------------------------------------------------------------------
-// Firefox reports wheel events with deltaMode=1 (DOM_DELTA_LINE) while
-// Chromium uses deltaMode=0 (DOM_DELTA_PIXEL). Winit passes these through
-// as different enum variants, and bevy_panorbit_camera applies different
-// scaling to each — resulting in ~2.5× faster zoom on Firefox.
-//
-// We fix this at the JS level by patching incoming wheel events *in-place*
-// (via Object.defineProperty) before winit's own listener fires. This keeps
-// all Rust-side sensitivity values browser-agnostic.
-// See: https://github.com/moonstripe/indra_net/issues/6
-// ---------------------------------------------------------------------------
 #[wasm_bindgen(inline_js = "
 export function install_gecko_wheel_fix(canvas_selector) {
     const PIXELS_PER_LINE = 20;
@@ -44,26 +36,47 @@ export function install_gecko_wheel_fix(canvas_selector) {
     if (!canvas) return;
 
     canvas.addEventListener('wheel', function(e) {
-        // deltaMode 1 = DOM_DELTA_LINE  (Firefox default)
-        // deltaMode 0 = DOM_DELTA_PIXEL (Chrome default)
         if (e.deltaMode === 1) {
             Object.defineProperty(e, 'deltaMode', { value: 0 });
             Object.defineProperty(e, 'deltaX',    { value: e.deltaX * PIXELS_PER_LINE });
             Object.defineProperty(e, 'deltaY',    { value: e.deltaY * PIXELS_PER_LINE });
             Object.defineProperty(e, 'deltaZ',    { value: e.deltaZ * PIXELS_PER_LINE });
         }
-    }, { capture: true });   // capture phase → fires before winit's handler
+    }, { capture: true });
 }
 ")]
 extern "C" {
     fn install_gecko_wheel_fix(canvas_selector: &str);
 }
 
+// ---------------------------------------------------------------------------
+// Performance constants
+// ---------------------------------------------------------------------------
 const AXIS_LENGTH: f32 = 500.;
-
-// Center of the [0,1] volume - camera will focus here
 const VOLUME_CENTER: Vec3 = Vec3::new(0.5, 0.5, 0.5);
 
+/// Distance at which points start to fade
+const FADE_START_DISTANCE: f32 = 2.0;
+/// Distance at which points are fully faded (alpha = MIN_ALPHA)
+const FADE_END_DISTANCE: f32 = 5.0;
+/// Minimum alpha for distant points (0 = hidden, 0.1 = barely visible)
+const MIN_ALPHA: f32 = 0.1;
+/// Distance beyond which points are hidden entirely (saves GPU)
+const CULL_DISTANCE: f32 = 8.0;
+
+/// LOD thresholds - switch to simpler meshes at these distances
+const LOD_HIGH_DISTANCE: f32 = 1.5; // Use high-detail mesh
+const LOD_MED_DISTANCE: f32 = 3.0; // Use medium-detail mesh
+                                   // Beyond LOD_MED_DISTANCE: Use low-detail mesh
+
+/// Sphere detail levels (segments)
+const SPHERE_SEGMENTS_HIGH: u32 = 16;
+const SPHERE_SEGMENTS_MED: u32 = 8;
+const SPHERE_SEGMENTS_LOW: u32 = 4;
+
+// ---------------------------------------------------------------------------
+// Static queues for JS interop
+// ---------------------------------------------------------------------------
 static EMBEDDING_QUEUE: Lazy<Mutex<Vec<JsEmbedding>>> = Lazy::new(|| Mutex::new(Vec::new()));
 static DELETE_QUEUE: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
 static EDGE_QUEUE: Lazy<Mutex<Vec<JsEdge>>> = Lazy::new(|| Mutex::new(Vec::new()));
@@ -72,10 +85,12 @@ static RENDERED_EMBEDDINGS: Lazy<Mutex<Vec<TextEmbedding>>> = Lazy::new(|| Mutex
 static RENDERED_EDGES: Lazy<Mutex<Vec<RenderedEdge>>> = Lazy::new(|| Mutex::new(Vec::new()));
 static SELECTED_EMBEDDING_ID: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
 
-// set to arbitrary handle, since this is the only "external" asset
 pub const LINE_SHADER_HANDLE: Handle<Shader> =
-    Handle::weak_from_u128(0xA3E0_9C7D_8B51_42C3_9F77_12AB_34CD_5678); // arbitrary hex
+    Handle::weak_from_u128(0xA3E0_9C7D_8B51_42C3_9F77_12AB_34CD_5678);
 
+// ---------------------------------------------------------------------------
+// Data structures
+// ---------------------------------------------------------------------------
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsEmbedding {
     pub id: String,
@@ -87,7 +102,7 @@ pub struct JsEdge {
     pub id: String,
     pub from: [f32; 3],
     pub to: [f32; 3],
-    pub color: Option<[f32; 4]>, // RGBA, optional - defaults to gray
+    pub color: Option<[f32; 4]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,99 +111,6 @@ struct RenderedEdge {
     from: [f32; 3],
     to: [f32; 3],
     drawn: bool,
-}
-
-#[derive(Resource)]
-struct EmbeddingQueueResource;
-
-#[wasm_bindgen]
-pub fn add_embedding(x: f32, y: f32, z: f32) -> String {
-    let embedding = JsEmbedding {
-        id: Uuid::new_v4().to_string(),
-        position: [x, y, z],
-    };
-
-    EMBEDDING_QUEUE.lock().unwrap().push(embedding.clone());
-
-    embedding.id
-}
-
-/// Add an edge (line) between two 3D positions
-/// Returns the edge ID
-#[wasm_bindgen]
-pub fn add_edge(from_x: f32, from_y: f32, from_z: f32, to_x: f32, to_y: f32, to_z: f32) -> String {
-    let edge = JsEdge {
-        id: Uuid::new_v4().to_string(),
-        from: [from_x, from_y, from_z],
-        to: [to_x, to_y, to_z],
-        color: None,
-    };
-
-    EDGE_QUEUE.lock().unwrap().push(edge.clone());
-
-    edge.id
-}
-
-/// Add an edge with a custom color (RGBA, each component 0.0-1.0)
-#[wasm_bindgen]
-pub fn add_edge_with_color(
-    from_x: f32,
-    from_y: f32,
-    from_z: f32,
-    to_x: f32,
-    to_y: f32,
-    to_z: f32,
-    r: f32,
-    g: f32,
-    b: f32,
-    a: f32,
-) -> String {
-    let edge = JsEdge {
-        id: Uuid::new_v4().to_string(),
-        from: [from_x, from_y, from_z],
-        to: [to_x, to_y, to_z],
-        color: Some([r, g, b, a]),
-    };
-
-    EDGE_QUEUE.lock().unwrap().push(edge.clone());
-
-    edge.id
-}
-
-/// Delete an edge by ID
-#[wasm_bindgen]
-pub fn delete_edge_by_id(id: String) {
-    EDGE_DELETE_QUEUE.lock().unwrap().push(id);
-}
-
-/// Get all rendered edges
-#[wasm_bindgen]
-pub fn get_edges() -> JsValue {
-    let export = RENDERED_EDGES.lock().unwrap();
-    serde_wasm_bindgen::to_value(&*export).unwrap_or(JsValue::NULL)
-}
-
-#[wasm_bindgen]
-pub fn get_embeddings() -> JsValue {
-    let export = RENDERED_EMBEDDINGS.lock().unwrap();
-    serde_wasm_bindgen::to_value(&*export).unwrap_or(JsValue::NULL)
-}
-
-#[wasm_bindgen]
-pub fn delete_embedding_by_id(id: String) {
-    DELETE_QUEUE.lock().unwrap().push(id);
-}
-
-/// Get the currently selected embedding ID (if any)
-#[wasm_bindgen]
-pub fn get_selected_id() -> Option<String> {
-    SELECTED_EMBEDDING_ID.lock().unwrap().clone()
-}
-
-/// Clear the selection
-#[wasm_bindgen]
-pub fn clear_selection() {
-    *SELECTED_EMBEDDING_ID.lock().unwrap() = None;
 }
 
 #[derive(Component, Debug, Clone, Serialize, Deserialize)]
@@ -201,10 +123,27 @@ struct TextEmbedding {
 #[derive(Component)]
 struct Selected;
 
-/// Component to mark edge entities
 #[derive(Component)]
 struct EdgeEntity {
+    #[allow(dead_code)]
     id: String,
+}
+
+/// Track current LOD level to avoid unnecessary mesh swaps
+#[derive(Component, Default, PartialEq, Eq, Clone, Copy)]
+enum LodLevel {
+    #[default]
+    High,
+    Medium,
+    Low,
+}
+
+/// Shared mesh handles for LOD levels
+#[derive(Resource)]
+struct SharedMeshes {
+    sphere_high: Handle<Mesh>,
+    sphere_med: Handle<Mesh>,
+    sphere_low: Handle<Mesh>,
 }
 
 #[derive(Asset, TypePath, Default, AsBindGroup, Debug, Clone)]
@@ -247,19 +186,119 @@ struct EmbeddingEntities(pub std::collections::HashMap<String, Entity>);
 #[derive(Resource, Default)]
 struct EdgeEntities(pub std::collections::HashMap<String, Entity>);
 
+#[derive(Resource)]
+struct EmbeddingQueueResource;
+
+/// Cache previous camera position to only update when moved
+#[derive(Resource, Default)]
+struct CameraCache {
+    last_position: Option<Vec3>,
+    frames_since_update: u32,
+}
+
+/// How often to update LOD/culling (every N frames)
+const LOD_UPDATE_INTERVAL: u32 = 3;
+
+// ---------------------------------------------------------------------------
+// WASM API
+// ---------------------------------------------------------------------------
+#[wasm_bindgen]
+pub fn add_embedding(x: f32, y: f32, z: f32) -> String {
+    let embedding = JsEmbedding {
+        id: Uuid::new_v4().to_string(),
+        position: [x, y, z],
+    };
+    EMBEDDING_QUEUE.lock().unwrap().push(embedding.clone());
+    embedding.id
+}
+
+#[wasm_bindgen]
+pub fn add_edge(from_x: f32, from_y: f32, from_z: f32, to_x: f32, to_y: f32, to_z: f32) -> String {
+    let edge = JsEdge {
+        id: Uuid::new_v4().to_string(),
+        from: [from_x, from_y, from_z],
+        to: [to_x, to_y, to_z],
+        color: None,
+    };
+    EDGE_QUEUE.lock().unwrap().push(edge.clone());
+    edge.id
+}
+
+#[wasm_bindgen]
+pub fn add_edge_with_color(
+    from_x: f32,
+    from_y: f32,
+    from_z: f32,
+    to_x: f32,
+    to_y: f32,
+    to_z: f32,
+    r: f32,
+    g: f32,
+    b: f32,
+    a: f32,
+) -> String {
+    let edge = JsEdge {
+        id: Uuid::new_v4().to_string(),
+        from: [from_x, from_y, from_z],
+        to: [to_x, to_y, to_z],
+        color: Some([r, g, b, a]),
+    };
+    EDGE_QUEUE.lock().unwrap().push(edge.clone());
+    edge.id
+}
+
+#[wasm_bindgen]
+pub fn delete_edge_by_id(id: String) {
+    EDGE_DELETE_QUEUE.lock().unwrap().push(id);
+}
+
+#[wasm_bindgen]
+pub fn get_edges() -> JsValue {
+    let export = RENDERED_EDGES.lock().unwrap();
+    serde_wasm_bindgen::to_value(&*export).unwrap_or(JsValue::NULL)
+}
+
+#[wasm_bindgen]
+pub fn get_embeddings() -> JsValue {
+    let export = RENDERED_EMBEDDINGS.lock().unwrap();
+    serde_wasm_bindgen::to_value(&*export).unwrap_or(JsValue::NULL)
+}
+
+#[wasm_bindgen]
+pub fn delete_embedding_by_id(id: String) {
+    DELETE_QUEUE.lock().unwrap().push(id);
+}
+
+#[wasm_bindgen]
+pub fn get_selected_id() -> Option<String> {
+    SELECTED_EMBEDDING_ID.lock().unwrap().clone()
+}
+
+#[wasm_bindgen]
+pub fn clear_selection() {
+    *SELECTED_EMBEDDING_ID.lock().unwrap() = None;
+}
+
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_name = should_show_ui)]
+    fn should_show_ui() -> bool;
+}
+
+// ---------------------------------------------------------------------------
+// Mesh conversion
+// ---------------------------------------------------------------------------
 impl From<Axis> for Mesh {
     fn from(axis: Axis) -> Self {
         let vertices = axis.line.to_vec();
-
-        Mesh::new(
-            // Line list: every pair is a start/end point
-            PrimitiveTopology::LineList,
-            RenderAssetUsages::RENDER_WORLD,
-        )
-        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, vertices)
+        Mesh::new(PrimitiveTopology::LineList, RenderAssetUsages::RENDER_WORLD)
+            .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, vertices)
     }
 }
 
+// ---------------------------------------------------------------------------
+// Systems
+// ---------------------------------------------------------------------------
 fn process_new_embeddings(mut renderer_state: ResMut<RendererState>) {
     match EMBEDDING_QUEUE.try_lock() {
         Ok(mut queue) => {
@@ -311,7 +350,6 @@ fn process_delete_embedding_requests(
     mut commands: Commands,
 ) {
     let mut queue = DELETE_QUEUE.lock().unwrap();
-
     if let Some(texts) = &mut renderer_state.texts {
         for id in queue.drain(..) {
             if let Some(entity) = entity_map.0.remove(&id) {
@@ -328,7 +366,6 @@ fn process_delete_edge_requests(
     mut commands: Commands,
 ) {
     let mut queue = EDGE_DELETE_QUEUE.lock().unwrap();
-
     if let Some(edges) = &mut renderer_state.edges {
         for id in queue.drain(..) {
             if let Some(entity) = edge_map.0.remove(&id) {
@@ -344,92 +381,79 @@ fn startup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut line_materials: ResMut<Assets<LineMaterial>>,
 ) {
-    // Light gray for axes - high contrast on dark background
+    // Create shared meshes for LOD levels
+    let sphere_high = meshes.add(
+        Sphere::new(0.01)
+            .mesh()
+            .ico(SPHERE_SEGMENTS_HIGH as usize)
+            .unwrap(),
+    );
+    let sphere_med = meshes.add(
+        Sphere::new(0.01)
+            .mesh()
+            .ico(SPHERE_SEGMENTS_MED as usize)
+            .unwrap(),
+    );
+    let sphere_low = meshes.add(
+        Sphere::new(0.01)
+            .mesh()
+            .ico(SPHERE_SEGMENTS_LOW as usize)
+            .unwrap(),
+    );
+
+    commands.insert_resource(SharedMeshes {
+        sphere_high,
+        sphere_med,
+        sphere_low,
+    });
+
     let axis_rgba = LinearRgba::new(0.7, 0.7, 0.7, 1.0);
 
     commands.spawn((
         Camera3dBundle {
-            // Position camera to look at center of [0,1] volume
             transform: Transform::from_translation(VOLUME_CENTER + Vec3::new(0.0, 1.0, 2.5))
                 .looking_at(VOLUME_CENTER, Vec3::Y),
             ..default()
         },
         PanOrbitCamera {
-            // Focus on center of volume
             focus: VOLUME_CENTER,
-
-            // turn off auto "uprighting"; avoids the snap you're calling "sticky up"
             allow_upside_down: true,
-
-            // don't let pitch reach the pole (numerical hell lives there)
-            pitch_upper_limit: Some(FRAC_PI_2 - 0.01), // ~+89°
-            pitch_lower_limit: Some(-FRAC_PI_2 + 0.01), // ~−89°
-
-            // Tuned for the [0,1] volume scene scale
+            pitch_upper_limit: Some(FRAC_PI_2 - 0.01),
+            pitch_lower_limit: Some(-FRAC_PI_2 + 0.01),
             orbit_sensitivity: 5.0,
             pan_sensitivity: 0.0,
             zoom_sensitivity: 0.22,
             orbit_smoothness: 0.06,
             pan_smoothness: 0.00,
             zoom_smoothness: 0.06,
-
-            // sensible zoom bounds for your scene scale
             zoom_lower_limit: Some(0.5),
             zoom_upper_limit: Some(5.0),
-
-            // Enable touch controls: one finger orbit, two finger pinch to zoom
             touch_enabled: true,
             touch_controls: TouchControls::OneFingerOrbit,
-
             ..default()
         },
     ));
 
-    // Define axes - starting from origin, extending along each axis
+    // Axes
     let origin = Vec3::ZERO;
-    let x_axis_end = Vec3::X * AXIS_LENGTH;
-    let y_axis_end = Vec3::Y * AXIS_LENGTH;
-    let z_axis_end = Vec3::Z * AXIS_LENGTH;
-
-    let x_axis = Axis {
-        line: [origin, x_axis_end],
-        color: axis_rgba,
-    };
-    let y_axis = Axis {
-        line: [origin, y_axis_end],
-        color: axis_rgba,
-    };
-    let z_axis = Axis {
-        line: [origin, z_axis_end],
-        color: axis_rgba,
-    };
-
-    // Spawn X Axis
-    commands.spawn(MaterialMeshBundle {
-        mesh: meshes.add(x_axis),
-        material: line_materials.add(LineMaterial {
-            color: x_axis.color,
-        }),
-        ..default()
-    });
-
-    // Spawn Y Axis
-    commands.spawn(MaterialMeshBundle {
-        mesh: meshes.add(y_axis),
-        material: line_materials.add(LineMaterial {
-            color: y_axis.color,
-        }),
-        ..default()
-    });
-
-    // Spawn Z Axis
-    commands.spawn(MaterialMeshBundle {
-        mesh: meshes.add(z_axis),
-        material: line_materials.add(LineMaterial {
-            color: z_axis.color,
-        }),
-        ..default()
-    });
+    for (end, color) in [
+        (Vec3::X * AXIS_LENGTH, axis_rgba),
+        (Vec3::Y * AXIS_LENGTH, axis_rgba),
+        (Vec3::Z * AXIS_LENGTH, axis_rgba),
+    ] {
+        let axis = Axis {
+            line: [origin, end],
+            color,
+        };
+        commands.spawn((
+            MaterialMeshBundle {
+                mesh: meshes.add(axis),
+                material: line_materials.add(LineMaterial { color }),
+                ..default()
+            },
+            NoFrustumCulling, // Axes should always be visible
+        ));
+    }
 }
 
 fn update(mut contexts: EguiContexts, renderer_state: Res<RendererState>) {
@@ -439,18 +463,17 @@ fn update(mut contexts: EguiContexts, renderer_state: Res<RendererState>) {
             .movable(false)
             .show(contexts.ctx_mut(), |ui| {
                 let num_texts = renderer_state.texts.as_ref().map_or(0, |t| t.len());
-
                 ui.label(format!("Rendering {} Text Embeddings.", num_texts));
 
                 if ui.button("Add Random Text Embedding").clicked() {
                     let mut rng = rand::thread_rng();
-                    let x = rng.gen_range(-1.0..1.0);
-                    let y = rng.gen_range(-1.0..1.0);
-                    let z = rng.gen_range(-1.0..1.0);
-
                     EMBEDDING_QUEUE.lock().unwrap().push(JsEmbedding {
                         id: Uuid::new_v4().to_string(),
-                        position: [x, y, z],
+                        position: [
+                            rng.gen_range(-1.0..1.0),
+                            rng.gen_range(-1.0..1.0),
+                            rng.gen_range(-1.0..1.0),
+                        ],
                     });
                 }
             });
@@ -471,46 +494,53 @@ fn sync_rendered_edges_to_js(renderer_state: Res<RendererState>) {
     }
 }
 
+/// Draw new embeddings with shared mesh (instancing-like behavior)
 fn draw_new_embeddings(
     mut commands: Commands,
     mut renderer_state: ResMut<RendererState>,
-    mut meshes: ResMut<Assets<Mesh>>,
+    shared_meshes: Res<SharedMeshes>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut entity_map: ResMut<EmbeddingEntities>,
 ) {
-    // White for embeddings - high contrast on dark background
     let emb_color = [1.0_f32, 1.0, 1.0, 1.0];
 
     if let Some(texts) = &mut renderer_state.texts {
         for text in texts {
             if !text.drawn {
+                let material = materials.add(StandardMaterial {
+                    base_color: Color::srgba(
+                        emb_color[0],
+                        emb_color[1],
+                        emb_color[2],
+                        emb_color[3],
+                    ),
+                    emissive: LinearRgba::new(
+                        emb_color[0],
+                        emb_color[1],
+                        emb_color[2],
+                        emb_color[3],
+                    ),
+                    alpha_mode: AlphaMode::Blend,
+                    ..default()
+                });
+
                 let entity = commands
-                    .spawn(PbrBundle {
-                        mesh: meshes.add(Sphere::new(0.01).mesh()),
-                        material: materials.add(StandardMaterial {
-                            base_color: Color::srgba(
-                                emb_color[0],
-                                emb_color[1],
-                                emb_color[2],
-                                emb_color[3],
+                    .spawn((
+                        PbrBundle {
+                            mesh: shared_meshes.sphere_high.clone(), // Start with high LOD
+                            material,
+                            transform: Transform::from_xyz(
+                                text.embedding[0],
+                                text.embedding[1],
+                                text.embedding[2],
                             ),
-                            emissive: LinearRgba::new(
-                                emb_color[0],
-                                emb_color[1],
-                                emb_color[2],
-                                emb_color[3],
-                            ),
-                            alpha_mode: AlphaMode::Blend,
                             ..default()
-                        }),
-                        transform: Transform::from_xyz(
-                            text.embedding[0],
-                            text.embedding[1],
-                            text.embedding[2],
-                        ),
-                        ..default()
-                    })
-                    .insert(text.clone())
+                        },
+                        text.clone(),
+                        LodLevel::High,
+                        // Add AABB for frustum culling (sphere radius 0.01)
+                        Aabb::from_min_max(Vec3::splat(-0.01), Vec3::splat(0.01)),
+                    ))
                     .id();
 
                 entity_map.0.insert(text.id.clone(), entity);
@@ -528,7 +558,6 @@ fn draw_new_edges(
     mut line_materials: ResMut<Assets<LineMaterial>>,
     mut edge_map: ResMut<EdgeEntities>,
 ) {
-    // Default edge color - semi-transparent gray
     let default_color = LinearRgba::new(0.5, 0.5, 0.5, 0.6);
 
     if let Some(edges) = &mut renderer_state.edges {
@@ -537,22 +566,23 @@ fn draw_new_edges(
                 let from = Vec3::new(edge.from[0], edge.from[1], edge.from[2]);
                 let to = Vec3::new(edge.to[0], edge.to[1], edge.to[2]);
 
-                // Create line mesh
                 let line_mesh =
                     Mesh::new(PrimitiveTopology::LineList, RenderAssetUsages::RENDER_WORLD)
                         .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, vec![from, to]);
 
                 let entity = commands
-                    .spawn(MaterialMeshBundle {
-                        mesh: meshes.add(line_mesh),
-                        material: line_materials.add(LineMaterial {
-                            color: default_color,
-                        }),
-                        ..default()
-                    })
-                    .insert(EdgeEntity {
-                        id: edge.id.clone(),
-                    })
+                    .spawn((
+                        MaterialMeshBundle {
+                            mesh: meshes.add(line_mesh),
+                            material: line_materials.add(LineMaterial {
+                                color: default_color,
+                            }),
+                            ..default()
+                        },
+                        EdgeEntity {
+                            id: edge.id.clone(),
+                        },
+                    ))
                     .id();
 
                 edge_map.0.insert(edge.id.clone(), entity);
@@ -562,33 +592,86 @@ fn draw_new_edges(
     }
 }
 
-fn blur_embeddings(
+/// Optimized visibility/LOD/alpha system - runs every N frames
+fn update_embedding_visibility(
     camera_query: Query<&Transform, With<Camera>>,
-    mut emb_query: Query<(&Transform, &Handle<StandardMaterial>), With<TextEmbedding>>,
+    mut emb_query: Query<
+        (
+            &Transform,
+            &Handle<StandardMaterial>,
+            &mut Handle<Mesh>,
+            &mut LodLevel,
+            &mut Visibility,
+        ),
+        With<TextEmbedding>,
+    >,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    shared_meshes: Res<SharedMeshes>,
+    mut cache: ResMut<CameraCache>,
 ) {
+    // Throttle updates
+    cache.frames_since_update += 1;
+
     let camera_transform = camera_query.single();
+    let camera_pos = camera_transform.translation;
 
-    for (&emb_transform, emb_material) in emb_query.iter_mut() {
-        let depth = (camera_transform.translation - emb_transform.translation).length();
+    // Skip if camera hasn't moved significantly and not time for periodic update
+    if let Some(last_pos) = cache.last_position {
+        let moved = camera_pos.distance(last_pos) > 0.01;
+        if !moved && cache.frames_since_update < LOD_UPDATE_INTERVAL {
+            return;
+        }
+    }
 
-        let opacity = if depth >= 5.0 {
-            0.1
+    cache.last_position = Some(camera_pos);
+    cache.frames_since_update = 0;
+
+    for (emb_transform, emb_material, mut mesh_handle, mut lod, mut visibility) in
+        emb_query.iter_mut()
+    {
+        let distance = camera_pos.distance(emb_transform.translation);
+
+        // Distance culling - hide very distant points
+        if distance > CULL_DISTANCE {
+            *visibility = Visibility::Hidden;
+            continue;
+        } else if *visibility == Visibility::Hidden {
+            *visibility = Visibility::Inherited;
+        }
+
+        // LOD switching
+        let new_lod = if distance < LOD_HIGH_DISTANCE {
+            LodLevel::High
+        } else if distance < LOD_MED_DISTANCE {
+            LodLevel::Medium
         } else {
-            1.0 - (depth / 5.0) * 0.9
+            LodLevel::Low
+        };
+
+        if new_lod != *lod {
+            *lod = new_lod;
+            *mesh_handle = match new_lod {
+                LodLevel::High => shared_meshes.sphere_high.clone(),
+                LodLevel::Medium => shared_meshes.sphere_med.clone(),
+                LodLevel::Low => shared_meshes.sphere_low.clone(),
+            };
+        }
+
+        // Alpha fade based on distance
+        let alpha = if distance <= FADE_START_DISTANCE {
+            1.0
+        } else if distance >= FADE_END_DISTANCE {
+            MIN_ALPHA
+        } else {
+            let t = (distance - FADE_START_DISTANCE) / (FADE_END_DISTANCE - FADE_START_DISTANCE);
+            1.0 - t * (1.0 - MIN_ALPHA)
         };
 
         if let Some(material) = materials.get_mut(emb_material) {
-            material.base_color.set_alpha(opacity);
-            material.emissive.set_alpha(opacity);
+            material.base_color.set_alpha(alpha);
+            material.emissive.set_alpha(alpha);
         }
     }
-}
-
-#[wasm_bindgen]
-extern "C" {
-    #[wasm_bindgen(js_name = should_show_ui)]
-    fn should_show_ui() -> bool;
 }
 
 fn log_window(window_q: Query<&Window, With<PrimaryWindow>>) {
@@ -603,27 +686,22 @@ fn log_window(window_q: Query<&Window, With<PrimaryWindow>>) {
     );
 }
 
-/// Selection radius in world units around each embedding center.
-/// This is larger than the sphere mesh radius (0.01) to make selection practical.
+// ---------------------------------------------------------------------------
+// Selection
+// ---------------------------------------------------------------------------
 const SELECTION_RADIUS: f32 = 0.03;
-
-/// Tolerance for tap vs drag detection (in pixels)
 const TAP_TOLERANCE: f32 = 10.0;
 
-/// Resource to track touch start position for tap detection
 #[derive(Resource, Default)]
 struct TouchTapTracker {
     start_position: Option<Vec2>,
     touch_id: Option<u64>,
 }
 
-/// Returns the shortest distance from a ray to a point in space.
 fn distance_ray_to_point(ray: &Ray3d, point: Vec3) -> f32 {
-    // |(p0 - point) x d|, where p0 is ray origin and d is unit ray direction
     (ray.origin - point).cross(ray.direction.as_vec3()).length()
 }
 
-/// Helper function to perform selection at a given screen position
 fn select_at_position(
     position: Vec2,
     camera: &Camera,
@@ -635,7 +713,6 @@ fn select_at_position(
         return;
     };
 
-    // Find closest embedding within threshold
     let mut best: Option<(Entity, f32)> = None;
 
     for (entity, transform, _emb, _sel) in q_embeddings.iter_mut() {
@@ -643,7 +720,6 @@ fn select_at_position(
         let d = distance_ray_to_point(&ray, center);
 
         if d <= SELECTION_RADIUS {
-            // Use distance along the ray to prefer the front-most hit
             let along = (center - ray.origin).dot(*ray.direction).max(0.0);
             match best {
                 None => best = Some((entity, along)),
@@ -653,22 +729,18 @@ fn select_at_position(
         }
     }
 
-    // If nothing is close enough, clear selection
     if best.is_none() {
-        // remove Selected from all
         for (entity, _, _, maybe_sel) in q_embeddings.iter_mut() {
             if maybe_sel.is_some() {
                 commands.entity(entity).remove::<Selected>();
             }
         }
-        // Clear JS-accessible selection
         *SELECTED_EMBEDDING_ID.lock().unwrap() = None;
         return;
     }
 
     let (winner, _) = best.unwrap();
 
-    // Toggle semantics: if the winner is already selected, unselect it. Otherwise, select it and unselect others.
     let mut winner_was_selected = false;
     for (entity, _, _, maybe_sel) in q_embeddings.iter_mut() {
         if entity == winner && maybe_sel.is_some() {
@@ -678,18 +750,14 @@ fn select_at_position(
 
     if winner_was_selected {
         commands.entity(winner).remove::<Selected>();
-        // Clear selection in JS-accessible static
         *SELECTED_EMBEDDING_ID.lock().unwrap() = None;
     } else {
-        // clear others
         for (entity, _, _, maybe_sel) in q_embeddings.iter_mut() {
             if maybe_sel.is_some() && entity != winner {
                 commands.entity(entity).remove::<Selected>();
             }
         }
-        // set winner
         commands.entity(winner).insert(Selected);
-        // Update JS-accessible static with selected ID
         for (entity, _, emb, _) in q_embeddings.iter() {
             if entity == winner {
                 *SELECTED_EMBEDDING_ID.lock().unwrap() = Some(emb.id.clone());
@@ -699,7 +767,6 @@ fn select_at_position(
     }
 }
 
-/// Casts a ray from the cursor and selects the nearest embedding within SELECTION_RADIUS.
 fn select_embedding_on_click(
     buttons: Res<ButtonInput<MouseButton>>,
     windows: Query<&Window, With<PrimaryWindow>>,
@@ -707,7 +774,6 @@ fn select_embedding_on_click(
     mut q_embeddings: Query<(Entity, &Transform, &TextEmbedding, Option<&Selected>)>,
     mut commands: Commands,
 ) {
-    // Only act on fresh click
     if !buttons.just_pressed(MouseButton::Left) {
         return;
     }
@@ -727,7 +793,6 @@ fn select_embedding_on_click(
     );
 }
 
-/// Track touch start/end for tap detection and selection on mobile
 fn select_embedding_on_tap(
     touches: Res<Touches>,
     mut tap_tracker: ResMut<TouchTapTracker>,
@@ -736,37 +801,29 @@ fn select_embedding_on_tap(
     mut q_embeddings: Query<(Entity, &Transform, &TextEmbedding, Option<&Selected>)>,
     mut commands: Commands,
 ) {
-    // Track new touch starts
     for touch in touches.iter_just_pressed() {
-        // Only track single finger taps
         if touches.iter().count() == 1 {
             tap_tracker.start_position = Some(touch.position());
             tap_tracker.touch_id = Some(touch.id());
         } else {
-            // Multi-touch, cancel tap tracking
             tap_tracker.start_position = None;
             tap_tracker.touch_id = None;
         }
     }
 
-    // Check for touch end (tap completion)
     for touch in touches.iter_just_released() {
         if let (Some(start_pos), Some(tracked_id)) =
             (tap_tracker.start_position, tap_tracker.touch_id)
         {
             if touch.id() == tracked_id {
                 let end_pos = touch.position();
-                let distance = start_pos.distance(end_pos);
-
-                // If finger didn't move much, treat as a tap
-                if distance < TAP_TOLERANCE {
+                if start_pos.distance(end_pos) < TAP_TOLERANCE {
                     let Ok(window) = windows.get_single() else {
                         tap_tracker.start_position = None;
                         tap_tracker.touch_id = None;
                         continue;
                     };
 
-                    // Check if touch is within window bounds
                     if end_pos.x >= 0.0
                         && end_pos.x <= window.width()
                         && end_pos.y >= 0.0
@@ -784,57 +841,49 @@ fn select_embedding_on_tap(
                 }
             }
         }
-
-        // Clear tracker after any touch release
         tap_tracker.start_position = None;
         tap_tracker.touch_id = None;
     }
 
-    // Cancel tap if finger moves too much during the touch
     if let (Some(start_pos), Some(tracked_id)) = (tap_tracker.start_position, tap_tracker.touch_id)
     {
         for touch in touches.iter() {
-            if touch.id() == tracked_id {
-                let current_pos = touch.position();
-                if start_pos.distance(current_pos) > TAP_TOLERANCE {
-                    // User is dragging, not tapping
-                    tap_tracker.start_position = None;
-                    tap_tracker.touch_id = None;
-                }
+            if touch.id() == tracked_id && start_pos.distance(touch.position()) > TAP_TOLERANCE {
+                tap_tracker.start_position = None;
+                tap_tracker.touch_id = None;
             }
         }
     }
 }
 
-/// Visually reflects selection by scaling selected embeddings up, others to normal.
 fn apply_selection_visuals(mut q: Query<(&mut Transform, Option<&Selected>), With<TextEmbedding>>) {
     for (mut transform, maybe_sel) in q.iter_mut() {
-        if maybe_sel.is_some() {
-            // match previous behavior: x3 when selected
-            transform.scale = Vec3::splat(3.0);
+        transform.scale = if maybe_sel.is_some() {
+            Vec3::splat(3.0)
         } else {
-            transform.scale = Vec3::ONE;
-        }
+            Vec3::ONE
+        };
     }
 }
 
 fn register_internal_shader(mut shaders: ResMut<Assets<Shader>>) {
-    // path is relative to this file; adjust if you move things
     let src = include_str!("../assets/shaders/line_material.wgsl");
     let shader = Shader::from_wgsl(src, "embedded://line_material.wgsl");
     shaders.insert(&LINE_SHADER_HANDLE, shader);
 }
 
+// ---------------------------------------------------------------------------
+// App
+// ---------------------------------------------------------------------------
 #[wasm_bindgen(start)]
 pub fn run() {
-    // Patch Firefox wheel events before Bevy/winit registers its own listeners.
     install_gecko_wheel_fix("#vector-canvas");
 
     App::new()
         .add_plugins((
             DefaultPlugins.set(WindowPlugin {
                 primary_window: Some(Window {
-                    title: "Vector Renderer Test".to_string(),
+                    title: "Vector Renderer".to_string(),
                     canvas: Some("#vector-canvas".into()),
                     fit_canvas_to_parent: true,
                     ..Default::default()
@@ -844,7 +893,6 @@ pub fn run() {
             MaterialPlugin::<LineMaterial>::default(),
             PanOrbitCameraPlugin,
             EguiPlugin,
-            // bevy_mod_picking removed
         ))
         .insert_resource(ClearColor(Color::NONE))
         .insert_resource(EmbeddingEntities::default())
@@ -855,6 +903,7 @@ pub fn run() {
         })
         .insert_resource(EmbeddingQueueResource)
         .insert_resource(TouchTapTracker::default())
+        .insert_resource(CameraCache::default())
         .add_systems(Startup, (register_internal_shader, startup, log_window))
         .add_systems(PreUpdate, (process_new_embeddings, process_new_edges))
         .add_systems(
@@ -865,15 +914,15 @@ pub fn run() {
                 draw_new_edges,
                 process_delete_embedding_requests,
                 process_delete_edge_requests,
-                select_embedding_on_click, // Mouse selection handler
-                select_embedding_on_tap,   // Touch/tap selection handler
-                apply_selection_visuals,   // Visual scaling for selection
+                select_embedding_on_click,
+                select_embedding_on_tap,
+                apply_selection_visuals,
             ),
         )
         .add_systems(
             PostUpdate,
             (
-                blur_embeddings,
+                update_embedding_visibility, // Optimized LOD/culling/alpha
                 sync_rendered_embeddings_to_js,
                 sync_rendered_edges_to_js,
             ),
