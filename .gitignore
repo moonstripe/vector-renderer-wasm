@@ -1,3 +1,4 @@
 /target
 /wasm
 flake.lock
+.DS_Store
